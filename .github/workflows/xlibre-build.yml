@@ -1,0 +1,161 @@
+name: Track, Build, and Package XLibre
+
+on:
+  schedule:
+    # Runs on days 1, 13 and 25 of each month (roughly every 12 days)
+    - cron: '0 0 */12 * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if a release for this commit already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout XLibre
+      uses: actions/checkout@v4
+      with:
+        repository: X11Libre/xserver
+        path: xsource
+
+    - name: Read upstream commit
+      run: |
+        HASH=$(git -C xsource rev-parse HEAD)
+        echo "LATEST_HASH=$HASH" >> "$GITHUB_ENV"
+        echo "SHORT_HASH=${HASH:0:7}" >> "$GITHUB_ENV"
+
+    - name: Skip if this commit was already released
+      id: check
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        if [ "${{ inputs.force }}" != "true" ] && gh release view "xlibre-$SHORT_HASH" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "Release xlibre-$SHORT_HASH already exists, skipping."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install build dependencies
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        # Enable source repos so we can pull Ubuntu's own xorg-server build deps
+        sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+        sudo apt-get update
+        sudo apt-get build-dep -y xorg-server
+        sudo apt-get install -y meson ninja-build build-essential pkg-config \
+          libxcvt-dev libxkbfile-dev libxfont-dev libpixman-1-dev libdrm-dev \
+          libgbm-dev libepoxy-dev libudev-dev libpciaccess-dev libxshmfence-dev \
+          libtirpc-dev nettle-dev x11proto-dev xfonts-utils jq
+
+    - name: Install nFPM
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        echo 'deb [trusted=yes] https://repo.goreleaser.com/apt/ /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+        sudo apt-get update
+        sudo apt-get install -y nfpm
+
+    - name: Configure and compile
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        meson setup build xsource --buildtype=release --prefix=/usr
+        meson compile -C build
+        DESTDIR="$PWD/dist" meson install -C build
+        UPSTREAM_VER=$(meson introspect build --projectinfo | jq -r .version)
+        echo "PKG_VERSION=${UPSTREAM_VER}+git$(date -u +%Y%m%d).${SHORT_HASH}" >> "$GITHUB_ENV"
+
+    - name: Work out Debian runtime dependencies
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        # Map every shared library the installed binaries link against to its Ubuntu package
+        find dist -type f -exec sh -c 'file -b "$1" | grep -q ELF' _ {} \; -print \
+          | xargs -r ldd 2>/dev/null \
+          | awk '/=> \// {print $3}' | sort -u \
+          | while read -r lib; do echo "$lib"; readlink -f "$lib"; done | sort -u \
+          | xargs -r dpkg -S 2>/dev/null \
+          | cut -d: -f1 | sort -u > deb-depends.txt
+        cat deb-depends.txt
+
+    # The metadata tells APT/DNF to pull runtime libraries,
+    # but conflict with and replace the native Xorg server packages.
+    - name: Create nFPM configuration
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        {
+          cat <<EOF
+        name: xlibre
+        arch: amd64
+        platform: linux
+        version: "${PKG_VERSION}"
+        version_schema: none
+        release: "1"
+        section: x11
+        priority: optional
+        maintainer: "XLibre Autobuilds <noreply@github.com>"
+        description: "Automated independent build of the XLibre Xserver."
+        vendor: "XLibre autobuilds"
+        homepage: "https://github.com/${GITHUB_REPOSITORY}"
+        license: MIT
+
+        overrides:
+          deb:
+            depends:
+        $(sed 's/^/          - /' deb-depends.txt)
+            conflicts: [xserver-xorg-core, xserver-common]
+            replaces: [xserver-xorg-core, xserver-common]
+            provides: [xserver-xorg-core]
+          rpm:
+            depends:
+              - glibc
+              - pixman
+              - libdrm
+              - libepoxy
+              - mesa-libgbm
+              - libXfont2
+              - libxcvt
+              - libpciaccess
+              - libxshmfence
+              - libXau
+              - libXdmcp
+            conflicts: [xorg-x11-server-Xorg, xorg-x11-server-common]
+            provides: [xorg-x11-server-Xorg]
+
+        contents:
+        EOF
+          # List every installed file explicitly (keeps symlinks as symlinks)
+          (cd dist && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | sort) | while read -r f; do
+            if [ -L "dist/$f" ]; then
+              printf '  - src: "%s"\n    dst: "/%s"\n    type: symlink\n' "$(readlink "dist/$f")" "$f"
+            else
+              printf '  - src: "./dist/%s"\n    dst: "/%s"\n' "$f" "$f"
+            fi
+          done
+        } > nfpm.yaml
+        cat nfpm.yaml
+
+    - name: Generate packages
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        nfpm package --config nfpm.yaml --packager deb --target "xlibre_${SHORT_HASH}_amd64.deb"
+        nfpm package --config nfpm.yaml --packager rpm --target "xlibre-${SHORT_HASH}.x86_64.rpm"
+        tar -czvf "xlibre-${SHORT_HASH}.tar.gz" -C dist/usr .
+
+    - name: Publish build to release
+      if: steps.check.outputs.skip != 'true'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: xlibre-${{ env.SHORT_HASH }}
+        name: XLibre Build (${{ env.SHORT_HASH }})
+        body: |
+          Automated multi-package build of the XLibre Xserver.
+          Built from upstream commit: https://github.com/X11Libre/xserver/commit/${{ env.LATEST_HASH }}
+          *Replaces the standard Xorg server packages.*
+        files: |
+          xlibre_${{ env.SHORT_HASH }}_amd64.deb
+          xlibre-${{ env.SHORT_HASH }}.x86_64.rpm
+          xlibre-${{ env.SHORT_HASH }}.tar.gz
