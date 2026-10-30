@@ -53,6 +53,14 @@ jobs:
           libgbm-dev libepoxy-dev libudev-dev libpciaccess-dev libxshmfence-dev \
           libtirpc-dev nettle-dev x11proto-dev xfonts-utils jq
 
+    - name: Install newer xorgproto
+      if: steps.check.outputs.skip != 'true'
+      run: |
+        # XLibre needs presentproto >= 1.4 (xorgproto 2024.1); Ubuntu 24.04 ships 2023.2
+        curl -fsSL https://xorg.freedesktop.org/archive/individual/proto/xorgproto-2024.1.tar.xz | tar -xJ
+        meson setup xorgproto-build xorgproto-2024.1 --prefix=/usr
+        sudo meson install -C xorgproto-build
+
     - name: Install nFPM
       if: steps.check.outputs.skip != 'true'
       run: |
