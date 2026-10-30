@@ -1,18 +1,15 @@
-name: Track and Build XLibre
+name: Track, Build, and Package XLibre
 
 on:
   schedule:
-    # Runs exactly every 12 days at midnight UTC
     - cron: '0 0 */12 * *'
   workflow_dispatch:
-    # Provides a manual "Run Workflow" button in the GitHub UI
 
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
 
     steps:
-    # 1. Fetch the absolute latest commit hash from XLibre's repository
     - name: Fetch Latest Commit Hash
       id: get_hash
       run: |
@@ -20,40 +17,94 @@ jobs:
         echo "LATEST_HASH=$HASH" >> $GITHUB_ENV
         echo "SHORT_HASH=${HASH:0:7}" >> $GITHUB_ENV
 
-    # 2. Checkout the external repository onto your runner
+    - name: Checkout Automation Repository
+      uses: actions/checkout@v4
+
     - name: Checkout XLibre
       uses: actions/checkout@v4
       with:
         repository: 'X11Libre/xserver'
         ref: ${{ env.LATEST_HASH }}
+        path: xsource
 
-    # 3. Setup build environment and dependencies
-    - name: Install Dependencies
+    - name: Install Build Tools & Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y meson ninja-build build-essential xorg-dev libx11-dev libxext-dev libxrender-dev libxi-dev
 
-    # 4. Configure with Meson (Standard for modern XLibre)
-    - name: Configure Build
-      run: meson setup build/ --buildtype=release
+    - name: Install NFPM
+      run: |
+        echo 'deb [trusted=yes] https://goreleaser.com /' | sudo tee /etc/apt/sources.list.d/goreleaser.list
+        sudo apt-get update
+        sudo apt-get install -y nfpm
 
-    # 5. Compile with Ninja
-    - name: Compile XLibre
-      run: meson compile -C build/
+    - name: Configure and Compile
+      run: |
+        meson setup build/ xsource/ --buildtype=release --prefix=/usr
+        meson compile -C build/
+        DESTDIR=$PWD/dist meson install -C build/
 
-    # 6. Compress the compiled outputs
-    - name: Archive Binaries
-      run: tar -czvf xlibre-${{ env.SHORT_HASH }}.tar.gz build/
+    # The metadata tells APT and DNF to pull core runtime libraries, 
+    # but forcefully conflict with and substitute the native xserver-xorg stack.
+    - name: Create NFPM Configuration
+      run: |
+        cat <<EOF > nfpm.yaml
+        name: "xlibre"
+        arch: "amd64"
+        platform: "linux"
+        version: "1.0.0-${{ env.SHORT_HASH }}"
+        section: "x11"
+        priority: "optional"
+        maintainer: "Shantil-K <automation@github.com>"
+        description: "Automated independent build of XLibre Xserver."
+        homepage: "https://github.com"
+        license: "MIT"
+        
+        depends:
+          - libc6
+          - libx11-6
+          - libxext6
+          - libxrender1
+          - libxi6
+          
+        conflicts:
+          - xserver-xorg
+          - xserver-xorg-core
+          
+        replaces:
+          - xserver-xorg
+          - xserver-xorg-core
+          
+        provides:
+          - xserver-xorg
+          - xserver-xorg-core
 
-    # 7. Create a clean GitHub Release on your personal repository
+        contents:
+          - src: ./dist/usr/bin/*
+            dst: /usr/bin/
+          - src: ./dist/usr/lib/*
+            dst: /usr/lib/
+        EOF
+
+    # Generate the custom deb and rpm packages
+    - name: Generate Packages
+      run: |
+        nfpm package --config nfpm.yaml --target xlibre_${{ env.SHORT_HASH }}.deb
+        nfpm package --config nfpm.yaml --target xlibre-${{ env.SHORT_HASH }}.x86_64.rpm
+        tar -czvf xlibre-${{ env.SHORT_HASH }}.tar.gz -C dist/usr .
+
     - name: Publish Build to Release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: xlibre-${{ env.SHORT_HASH }}
-        name: XLibre Automated Build (${{ env.SHORT_HASH }})
+        name: XLibre Conflict-Free Build (${{ env.SHORT_HASH }})
         body: |
-          Automated compilation of XLibre Xserver.
-          Built from upstream commit: https://github.com{{ env.LATEST_HASH }}
-        files: xlibre-${{ env.SHORT_HASH }}.tar.gz
+          Automated multi-package compilation of XLibre Xserver.
+          Built from upstream commit: https://github.com/commit/${{ env.LATEST_HASH }}
+          *Automatically replaces standard xserver-xorg package sets.*
+        files: |
+          xlibre_${{ env.SHORT_HASH }}.deb
+          xlibre-${{ env.SHORT_HASH }}.x86_64.rpm
+          xlibre-${{ env.SHORT_HASH }}.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
