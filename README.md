@@ -1,6 +1,10 @@
 # XLibre Automated Multi-Package Builds
 
-This repository hosts a fully automated continuous integration pipeline that tracks the upstream [XLibre Xserver development branch](https://github.com). Every **12 days**, a workflow automatically fetches the absolute latest source code, compiles it using the native Meson/Ninja toolkit, builds native package files with explicit runtime dependencies, and sets up seamless drops to the Releases page.
+This repository hosts a fully automated continuous integration pipeline that tracks the upstream [XLibre Xserver development branch](https://github.com/X11Libre/xserver). Roughly every **12 days** (on the 1st, 13th and 25th of each month), a workflow fetches the latest source code, compiles it with Meson/Ninja on Ubuntu 24.04, builds `.deb`, `.rpm` and `.tar.gz` packages, and publishes them to the Releases page.
+
+If the latest upstream commit has already been released, the scheduled run skips the build. Each release is tagged `xlibre-<short commit hash>` and links back to the upstream commit it was built from.
+
+The workflow lives at [`.github/workflows/xlibre-build.yml`](.github/workflows/xlibre-build.yml).
 
 ## Distribution Packages Provided
 
@@ -14,10 +18,14 @@ Each automated build automatically compiles three package profiles to accommodat
 ## Safe Installation & Conflict Resolution
 
 The generated `.deb` and `.rpm` binaries contain custom package manager metadata instructions (`conflicts`, `replaces`, and `provides`). When you run a local installation command, your system package manager will:
-1. **Identify Conflicts:** Locate any active instances of standard `xserver-xorg` or `xserver-xorg-core`.
-2. **Remove Xorg cleanly:** Purge those packages from your system directory space to prevent binary overlaps.
-3. **Handle Dependencies:** Query upstream network mirrors to automatically resolve and pull in platform dependencies like `libc6`, `libx11-6`, `libxext6`, `libxrender1`, and `libxi6`.
-4. **Deploy XLibre:** Bind the new high-performance XLibre graphics layers directly to `/usr/bin/` and `/usr/lib/`.
+1. **Identify Conflicts:** Find the standard Xorg server packages (`xserver-xorg-core` and `xserver-common` on Debian/Ubuntu, `xorg-x11-server-Xorg` and `xorg-x11-server-common` on Fedora/RHEL).
+2. **Remove Xorg:** Remove those packages so files don't overlap.
+3. **Handle Dependencies:** Pull in the runtime libraries XLibre needs. For the `.deb`, the dependency list is generated automatically from the libraries the compiled binaries actually link against. For the `.rpm`, it covers the main libraries (`glibc`, `pixman`, `libdrm`, `libepoxy`, `mesa-libgbm`, `libXfont2`, `libxcvt`, `libpciaccess`, `libxshmfence`, `libXau`, `libXdmcp`).
+4. **Install XLibre:** Install every file from the build under `/usr`.
+
+### Caveats
+* On Debian/Ubuntu, replacing `xserver-xorg-core` will likely also remove installed Xorg video and input driver packages (`xserver-xorg-video-*`, `xserver-xorg-input-*`), since they depend on it.
+* All packages are built on Ubuntu 24.04. The `.rpm` may not install on older Fedora/RHEL releases with an older glibc.
 
 ### 1. Installation on Ubuntu / Debian Derivatives (`apt`)
 ```bash
@@ -58,8 +66,17 @@ sudo dnf install xorg-x11-server-Xorg
 
 ## Manual Build Override
 
-If a critical upstream fix lands on the XLibre master branch and you do not want to wait for the standard 12-day build interval:
+If a critical upstream fix lands on the XLibre master branch and you do not want to wait for the next scheduled build:
 1. Navigate to the **Actions** tab along the top menu bar of this repository.
 2. Select **Track, Build, and Package XLibre** from the sidebar list.
-3. Click the **Run workflow** interactive button located on the right side.
-4. The system will cleanly rebuild the application stack and update the repository releases page within minutes.
+3. Click the **Run workflow** button on the right side.
+4. Optionally tick **force** to rebuild even if the current upstream commit already has a release.
+5. The new packages appear on the Releases page when the run finishes (usually a few minutes).
+
+## How the Build Works
+1. Checks out the latest `X11Libre/xserver` commit.
+2. Skips the run if a release for that commit already exists (unless forced).
+3. Installs Ubuntu's Xorg server build dependencies, plus `xorgproto` 2024.1 built from source (XLibre needs a newer version than Ubuntu 24.04 ships).
+4. Compiles and installs XLibre into a staging folder with `--prefix=/usr`.
+5. Generates the package metadata and builds the `.deb` and `.rpm` with [nFPM](https://nfpm.goreleaser.com/), plus a `.tar.gz` of `/usr`.
+6. Publishes all three files to a GitHub release.
