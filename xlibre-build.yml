@@ -1,0 +1,59 @@
+name: Track and Build XLibre
+
+on:
+  schedule:
+    # Runs exactly every 12 days at midnight UTC
+    - cron: '0 0 */12 * *'
+  workflow_dispatch:
+    # Provides a manual "Run Workflow" button in the GitHub UI
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. Fetch the absolute latest commit hash from XLibre's repository
+    - name: Fetch Latest Commit Hash
+      id: get_hash
+      run: |
+        HASH=$(git ls-remote https://github.com HEAD | awk '{print $1}')
+        echo "LATEST_HASH=$HASH" >> $GITHUB_ENV
+        echo "SHORT_HASH=${HASH:0:7}" >> $GITHUB_ENV
+
+    # 2. Checkout the external repository onto your runner
+    - name: Checkout XLibre
+      uses: actions/checkout@v4
+      with:
+        repository: 'X11Libre/xserver'
+        ref: ${{ env.LATEST_HASH }}
+
+    # 3. Setup build environment and dependencies
+    - name: Install Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y meson ninja-build build-essential xorg-dev libx11-dev libxext-dev libxrender-dev libxi-dev
+
+    # 4. Configure with Meson (Standard for modern XLibre)
+    - name: Configure Build
+      run: meson setup build/ --buildtype=release
+
+    # 5. Compile with Ninja
+    - name: Compile XLibre
+      run: meson compile -C build/
+
+    # 6. Compress the compiled outputs
+    - name: Archive Binaries
+      run: tar -czvf xlibre-${{ env.SHORT_HASH }}.tar.gz build/
+
+    # 7. Create a clean GitHub Release on your personal repository
+    - name: Publish Build to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: xlibre-${{ env.SHORT_HASH }}
+        name: XLibre Automated Build (${{ env.SHORT_HASH }})
+        body: |
+          Automated compilation of XLibre Xserver.
+          Built from upstream commit: https://github.com{{ env.LATEST_HASH }}
+        files: xlibre-${{ env.SHORT_HASH }}.tar.gz
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
